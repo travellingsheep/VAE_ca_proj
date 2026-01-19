@@ -1,9 +1,2 @@
-*.arrow
-*.pt
-*.rar
-*.jpg
-*.mnn
-*.data
-*.onnx
-!/src/checkpoints-lsfm/
-!/src/checkpoints-lsfm/**
+__pycache__/
+checkpoints/
