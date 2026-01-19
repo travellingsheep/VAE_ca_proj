@@ -24,9 +24,9 @@
 **参数尝试**
 - sd1.5应该对于现实图片有先验知识，表现为1to1甚至能够将细节补充的更加完善：
 经过1to1处理后：
-![alt text](assets\1to1.png)
+![alt text](assets/1to1.png)
 原图：
-![alt text](assets\1origin.png)
+![alt text](assets/1origin.png)
     - 尝试将identity_weights改为[1.8,0.8]，但最终0to0和1to1都崩坏了
     - 尝试设置为[1.0,1.0]，画面仍然崩坏
     - 感觉应该将identity_weights中1to1的比重设置的更大一些
@@ -36,9 +36,9 @@
 - 模型学习比较不稳定，并不是训练步数越多越好，经常出现效果不稳定的情况
     - 尝试加入ema。初步尝试decay=0.999，但是仅仅跑50个epoch左右无法充分体现ema的优势，最终体现为stage1中ema效果不如raw（不加ema）
     raw：
-    ![alt text](assets\raw.png)
+    ![alt text](assets/raw.png)
     ema：
-    ![alt text](assets\ema.png)
+    ![alt text](assets/ema.png)
     - 尝试强行使用ema，将decay设置成0.9，但是过分的扰动反而违背ema初衷，最后效果不好
     - 结论：不要加ema
 
