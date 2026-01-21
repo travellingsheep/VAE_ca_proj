@@ -9,10 +9,14 @@
   "training": {
     "batch_size": 64,
     "gen_batch_size": 64,
-    "learning_rate": 1e-4,
+    "learning_rate": 1e-5,
+    "lr_warmup_pct": 10,
+    "lr_min": 1e-6,
     "transfer_loss_weight": 10.0,
     "label_drop_prob": 0.15,
     "swd_loss_weight": 30.0,
+    "swd_ramp_start_pct": 20,
+    "swd_ramp_end_pct": 60,
     "swd_num_projections": 64,
     "swd_patch_size": 7,
     "swd_patch_stride": 4,
@@ -41,5 +45,8 @@
     "cfg_scale": 2.0,
     "use_cfg": true,
     "latent_clamp": 3.0
+  },
+  "evaluation": {
+    "vgg_ref_root": "D:\\000college\\1cs\\3projects\\CycleGAN\\datasets\\monet2photo\\train"
   }
 }

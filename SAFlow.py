@@ -33,6 +33,14 @@ class AdaGN(nn.Module):
             nn.SiLU(),
             nn.Linear(cond_dim, channels * 2)
         )
+
+        # 🟢 零初始化：让 AdaGN 初始等价于纯 GroupNorm（scale=0, shift=0）
+        # 公式 x = GN(x) * (1 + scale) + shift -> 初始为 x = GN(x)
+        last = self.modulation[-1]
+        if isinstance(last, nn.Linear):
+            nn.init.zeros_(last.weight)
+            if last.bias is not None:
+                nn.init.zeros_(last.bias)
         
     def forward(self, x, cond):
         """

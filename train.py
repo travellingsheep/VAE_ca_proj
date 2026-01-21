@@ -11,6 +11,7 @@ import sys
 import logging
 import time
 import numpy as np
+import math
 from PIL import Image
 from diffusers import AutoencoderKL
 import torch.nn.functional as F
@@ -253,13 +254,36 @@ class LSFMTrainer:
         self.use_ot_reorder = self.cfg['training'].get('use_ot_reorder', False)
         self.ot_reorder_freq = self.cfg['training'].get('ot_reorder_freq', 1)  # 每多少个batch进行一次OT重排
 
-        # 🟢 新增：SWD (Sliced Wasserstein Distance) 配置
+        # 🟢 SWD (Sliced Wasserstein Distance) 配置
+        # swd_loss_weight 是“目标值”，实际训练中可能按进度分阶段引入（见 ramp 配置）
         self.swd_weight = float(self.cfg['training'].get('swd_loss_weight', 0.0))
         self.swd_num_projections = int(self.cfg['training'].get('swd_num_projections', 64))
         self.swd_patch_size = int(self.cfg['training'].get('swd_patch_size', 7))
         self.swd_patch_stride = int(self.cfg['training'].get('swd_patch_stride', 4))
         self.swd_num_patches = int(self.cfg['training'].get('swd_num_patches', 0))
         self.swd_p = int(self.cfg['training'].get('swd_p', 2))
+
+        # 🟢 新增：SWD 分阶段引入（按总训练进度百分比）
+        # 进度 < start: 权重=0
+        # start ~ end: 权重线性从 0 -> swd_loss_weight
+        # 进度 >= end: 权重保持 swd_loss_weight
+        # 允许传入 0~100 (百分比) 或 0~1 (比例)
+        self.swd_ramp_start_pct = float(self.cfg['training'].get('swd_ramp_start_pct', 0.0))
+        self.swd_ramp_end_pct = float(self.cfg['training'].get('swd_ramp_end_pct', 0.0))
+        if self.swd_ramp_start_pct > 1.0:
+            self.swd_ramp_start_pct = self.swd_ramp_start_pct / 100.0
+        if self.swd_ramp_end_pct > 1.0:
+            self.swd_ramp_end_pct = self.swd_ramp_end_pct / 100.0
+        self.swd_ramp_start_pct = float(max(0.0, min(1.0, self.swd_ramp_start_pct)))
+        self.swd_ramp_end_pct = float(max(0.0, min(1.0, self.swd_ramp_end_pct)))
+
+        # 🟢 学习率调度：Warmup + Cosine Decay（按 step）
+        # warmup 允许传 0~100(%) 或 0~1(比例)，默认 10%
+        self.lr_warmup_pct = float(self.cfg['training'].get('lr_warmup_pct', 0.10))
+        if self.lr_warmup_pct > 1.0:
+            self.lr_warmup_pct = self.lr_warmup_pct / 100.0
+        self.lr_warmup_pct = float(max(0.0, min(1.0, self.lr_warmup_pct)))
+        self.lr_min = float(self.cfg['training'].get('lr_min', 1e-6))
         
         self.logger.info("="*50)
         self.logger.info(f"🚀 Initializing Experiment")
@@ -272,6 +296,12 @@ class LSFMTrainer:
         self.logger.info(f"🔄 OT Reorder: {self.use_ot_reorder} | Freq: {self.ot_reorder_freq}")
         self.logger.info(
             f"🌊 SWD: w={self.swd_weight} | K={self.swd_num_projections} | patch={self.swd_patch_size} stride={self.swd_patch_stride} | n_patches={self.swd_num_patches} | p={self.swd_p}"
+        )
+        self.logger.info(
+            f"🌊 SWD Ramp: start={self.swd_ramp_start_pct*100:.1f}% -> end={self.swd_ramp_end_pct*100:.1f}% (linear to w_target)"
+        )
+        self.logger.info(
+            f"📉 LR Schedule: warmup={self.lr_warmup_pct*100:.1f}% | min_lr={self.lr_min:g} | type=warmup+cosine(step)"
         )
         self.logger.info("="*50)
 
@@ -290,18 +320,65 @@ class LSFMTrainer:
 
         # 5. 推理预处理
         self.infer_transform = transforms.Compose([
-            transforms.Resize((256, 256)), 
+            transforms.Resize((256, 256)),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5])
         ])
 
+    def build_warmup_cosine_scheduler(self, optimizer, total_steps: int):
+        """Warmup + cosine decay scheduler stepped every batch."""
+        total_steps = int(max(1, total_steps))
+        warmup_steps = int(max(0, round(total_steps * self.lr_warmup_pct)))
+
+        # Per-param-group min_lr ratio
+        min_ratios = []
+        for group in optimizer.param_groups:
+            base_lr = float(group.get('initial_lr', group['lr']))
+            if base_lr <= 0:
+                min_ratios.append(0.0)
+            else:
+                min_ratios.append(float(self.lr_min / base_lr))
+
+        def make_lambda(min_ratio: float):
+            def lr_lambda(step: int):
+                s = int(step)
+                if warmup_steps > 0 and s < warmup_steps:
+                    # start small but non-zero
+                    return float((s + 1) / warmup_steps)
+                if total_steps <= warmup_steps:
+                    return 1.0
+                # cosine from 1.0 -> min_ratio
+                progress = (s - warmup_steps) / max(1, (total_steps - warmup_steps))
+                progress = max(0.0, min(1.0, float(progress)))
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                return float(min_ratio + (1.0 - min_ratio) * cosine)
+            return lr_lambda
+
+        lambdas = [make_lambda(r) for r in min_ratios]
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambdas)
+
+    def get_swd_weight(self, progress: float) -> float:
+        """Get current SWD weight based on training progress in [0,1]."""
+        if self.swd_weight <= 0:
+            return 0.0
+        p = float(progress)
+        if p <= self.swd_ramp_start_pct:
+            # 注意：当 start=0 时，p=0 应该直接进入 ramp/hold
+            if self.swd_ramp_start_pct <= 0.0 and self.swd_ramp_end_pct <= 0.0:
+                return float(self.swd_weight)
+            return 0.0
+        if self.swd_ramp_end_pct <= self.swd_ramp_start_pct:
+            return float(self.swd_weight)
+        if p >= self.swd_ramp_end_pct:
+            return float(self.swd_weight)
+        alpha = (p - self.swd_ramp_start_pct) / (self.swd_ramp_end_pct - self.swd_ramp_start_pct)
+        alpha = float(max(0.0, min(1.0, alpha)))
+        return float(self.swd_weight * alpha)
+
     def get_model(self):
         model = SAFModel(**self.cfg['model']).to(self.device, memory_format=torch.channels_last)
-        self.logger.info("[Model] Compiling network with torch.compile (max-autotune)...")
-        try:
-            model = torch.compile(model, mode="max-autotune")
-        except Exception as e:
-            self.logger.info(f"[Model] Compile warning: {e}")
+        # 🟢 临时关闭 torch.compile：先稳定训练，避免编译器引入数值/图捕获问题
+        self.logger.info("[Model] torch.compile disabled (temporary)")
         return model
 
     def safe_load(self, model, state_dict, strict=True):
@@ -386,7 +463,7 @@ class LSFMTrainer:
     def construct_target_lsfm(self, x_c, x_s):
         x_c, x_s = x_c.float(), x_s.float()
         B, C, H, W = x_c.size()
-        eps = 1e-5
+        eps = 1e-4
         
         zc = x_c.view(B, C, -1)
         zs = x_s.view(B, C, -1)
@@ -421,15 +498,14 @@ class LSFMTrainer:
         model = self.get_model()
         dl = DataLoader(self.train_ds, batch_size=self.cfg['training']['batch_size'], 
                         shuffle=True, num_workers=8, pin_memory=True, drop_last=True)
+
+        dl_len = len(dl)
         
         opt = torch.optim.AdamW(model.parameters(), lr=self.cfg['training']['learning_rate'])
         
         total_epochs = self.cfg['training']['stage1_epochs']
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, 
-            T_max=total_epochs, 
-            eta_min=1e-6
-        )
+        total_steps = max(1, total_epochs * dl_len)
+        scheduler = self.build_warmup_cosine_scheduler(opt, total_steps)
 
         # 🟢 新增：断点续训逻辑
         start_epoch = 0
@@ -456,6 +532,11 @@ class LSFMTrainer:
             pbar = tqdm(dl, desc=f"[S1] Epoch {epoch}/{total_epochs}", leave=False)
             
             for batch_idx, (x_c, x_s, t_id, s_id) in enumerate(pbar):
+                # 当前训练进度（0~1），用于 SWD 分阶段引入
+                global_step = (epoch - 1) * dl_len + batch_idx
+                progress = global_step / max(1, (total_steps - 1))
+                swd_w = self.get_swd_weight(progress)
+
                 x_c = x_c.to(self.device, memory_format=torch.channels_last, non_blocking=True)
                 x_s = x_s.to(self.device, memory_format=torch.channels_last, non_blocking=True)
                 t_id, s_id = t_id.to(self.device, non_blocking=True), s_id.to(self.device, non_blocking=True)
@@ -477,71 +558,80 @@ class LSFMTrainer:
                                                torch.full_like(t_id, self.null_class_id), 
                                                t_id)
                     
-                    target = self.construct_target_lsfm(x_c, x_s).to(memory_format=torch.channels_last)
-                    is_id = (s_id == t_id).view(-1, 1, 1, 1).float()
-                    target = is_id * x_c + (1 - is_id) * target
+                    # 🟢 修改：不再使用 SVD/WCT 构造 target，直接用“原图 latent”作为 ground-truth
+                    # 即 x0 = x_c, x1 = x_s，监督速度场 v_target = x1 - x0
+                    target = x_s
 
                 opt.zero_grad(set_to_none=True)
-                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    v_gt = target - x_c
-                    
-                    t = torch.rand(x_c.size(0), device=self.device)
-                    x_t = (1 - t.view(-1,1,1,1)) * x_c + t.view(-1,1,1,1) * target
-                    
-                    # 🟢 使用 dropped 的 label 训练
-                    v_pred = model(x_t, x_c, t, t_id_dropped)
-                    
-                    # 🟢 基础 MSE
-                    loss_mse_raw = F.mse_loss(v_pred, v_gt, reduction='none')
-                    loss_mse_per_sample = loss_mse_raw.mean(dim=[1, 2, 3])
-                    
-                    # 🟢 辅助损失仅用于非空类别的转换任务
-                    is_transfer = (s_id != t_id).float()
-                    is_not_null = (t_id_dropped != self.null_class_id).float()
-                    apply_aux_loss = (is_transfer * is_not_null).bool()
-                    
-                    if apply_aux_loss.any():
-                        loss_spec = compute_spectral_loss(
-                            v_pred[apply_aux_loss], 
-                            v_gt[apply_aux_loss]
-                        )
-                        
-                        v_pred_flat = v_pred[apply_aux_loss].flatten(1)
-                        v_gt_flat = v_gt[apply_aux_loss].flatten(1)
-                        cos_sim = F.cosine_similarity(v_pred_flat, v_gt_flat, dim=1, eps=1e-6)
-                        loss_dir = (1 - cos_sim).mean()
+                # 先在 fp32 构造监督与插值（更稳定）
+                v_gt = (target - x_c).float()
+                t = torch.rand(x_c.size(0), device=self.device, dtype=torch.float32)
+                t_view = t.view(-1, 1, 1, 1)
+                x_t = (1 - t_view) * x_c.float() + t_view * target.float()
 
-                        # 🟢 SWD：用 v_pred 推算预测最终 latent，再与真实 target latent 做 SWD
-                        if self.swd_weight > 0:
-                            t_aux = t[apply_aux_loss].view(-1, 1, 1, 1)
-                            z1_pred = x_t[apply_aux_loss].float() + (1.0 - t_aux) * v_pred[apply_aux_loss].float()
-                            z1_gt = target[apply_aux_loss].float()
-                            loss_swd = compute_swd_loss(
-                                z1_pred,
-                                z1_gt,
-                                num_projections=self.swd_num_projections,
-                                patch_size=self.swd_patch_size,
-                                patch_stride=self.swd_patch_stride,
-                                num_patches=self.swd_num_patches,
-                                p=self.swd_p,
-                            )
-                        else:
-                            loss_swd = torch.tensor(0.0, device=self.device)
+                # 🟢 修改：autocast 只包住模型 forward，loss 全部用 fp32 计算
+                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    v_pred = model(x_t, x_c, t, t_id_dropped)
+                v_pred = v_pred.float()
+
+                # 🟢 基础 MSE (fp32)
+                loss_mse_raw = F.mse_loss(v_pred, v_gt, reduction='none')
+                loss_mse_per_sample = loss_mse_raw.mean(dim=[1, 2, 3])
+
+                # 🟢 辅助损失仅用于非空类别的转换任务
+                is_transfer = (s_id != t_id).float()
+                is_not_null = (t_id_dropped != self.null_class_id).float()
+                apply_aux_loss = (is_transfer * is_not_null).bool()
+
+                if apply_aux_loss.any():
+                    loss_spec = compute_spectral_loss(
+                        v_pred[apply_aux_loss],
+                        v_gt[apply_aux_loss]
+                    )
+
+                    v_pred_flat = v_pred[apply_aux_loss].flatten(1)
+                    v_gt_flat = v_gt[apply_aux_loss].flatten(1)
+                    cos_sim = F.cosine_similarity(v_pred_flat, v_gt_flat, dim=1, eps=1e-6)
+                    loss_dir = (1 - cos_sim).mean()
+
+                    # 🟢 SWD：用 v_pred 推算预测最终 latent，再与真实 target latent 做 SWD
+                    if swd_w > 0:
+                        t_aux = t[apply_aux_loss].view(-1, 1, 1, 1)
+                        z1_pred = x_t[apply_aux_loss].float() + (1.0 - t_aux) * v_pred[apply_aux_loss]
+                        z1_gt = target[apply_aux_loss].float()
+                        loss_swd = compute_swd_loss(
+                            z1_pred,
+                            z1_gt,
+                            num_projections=self.swd_num_projections,
+                            patch_size=self.swd_patch_size,
+                            patch_stride=self.swd_patch_stride,
+                            num_patches=self.swd_num_patches,
+                            p=self.swd_p,
+                        )
                     else:
-                        loss_spec = torch.tensor(0.0, device=self.device)
-                        loss_dir = torch.tensor(0.0, device=self.device)
                         loss_swd = torch.tensor(0.0, device=self.device)
-                    
-                    # 🟢 加权 MSE
-                    sample_weights = 1.0 + is_transfer * (self.transfer_weight - 1.0)
-                    weighted_mse = (loss_mse_per_sample * sample_weights).mean()
-                    
-                    # 🟢 总损失
-                    loss = weighted_mse + 0.1 * loss_spec + 0.1 * loss_dir + self.swd_weight * loss_swd
+                else:
+                    loss_spec = torch.tensor(0.0, device=self.device)
+                    loss_dir = torch.tensor(0.0, device=self.device)
+                    loss_swd = torch.tensor(0.0, device=self.device)
+
+                # 🟢 加权 MSE
+                sample_weights = 1.0 + is_transfer * (self.transfer_weight - 1.0)
+                weighted_mse = (loss_mse_per_sample * sample_weights).mean()
+
+                # 🟢 总损失
+                loss = weighted_mse + 0.1 * loss_spec + 0.1 * loss_dir + swd_w * loss_swd
+
+                # 🟢 保险：loss 为 NaN/Inf 时跳过该 batch
+                if not torch.isfinite(loss.detach()):
+                    self.logger.info(f"[S1] ⚠️  Non-finite loss (NaN/Inf). Skip batch. epoch={epoch} batch={batch_idx}")
+                    pbar.set_postfix(loss="skip_nan")
+                    continue
 
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
                 opt.step()
+                scheduler.step()
                 
                 epoch_loss += loss.item()
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
@@ -553,10 +643,8 @@ class LSFMTrainer:
             if avg_loss < best_loss:
                 best_loss = avg_loss
             
-            current_lr = scheduler.get_last_lr()[0]
+            current_lr = opt.param_groups[0]['lr']
             self.logger.info(f"[S1] Epoch {epoch:03d} | Avg Loss: {avg_loss:.6f} | Best: {best_loss:.6f} | LR: {current_lr:.2e} | Time: {elapsed:.1f}s")
-            
-            scheduler.step()
 
             # 🟢 修改：保存包含训练状态的检查点
             if epoch % EVAL_STEP == 0:
@@ -645,15 +733,14 @@ class LSFMTrainer:
         dl = DataLoader(ds, batch_size=self.cfg['training']['batch_size'], 
                         shuffle=True, num_workers=8, pin_memory=True, 
                         persistent_workers=True, drop_last=True)
+
+        dl_len = len(dl)
         
         opt = torch.optim.AdamW(model.parameters(), lr=self.cfg['training']['learning_rate'])
         total_epochs = self.cfg['training']['stage2_epochs']
-        
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, 
-            T_max=total_epochs, 
-            eta_min=1e-6
-        )
+
+        total_steps = max(1, total_epochs * dl_len)
+        scheduler = self.build_warmup_cosine_scheduler(opt, total_steps)
         
         # 🟢 断点续训
         start_epoch = 0
@@ -682,14 +769,25 @@ class LSFMTrainer:
                 t_id = t_id.to(self.device, non_blocking=True)
                 
                 opt.zero_grad(set_to_none=True)
+                t = torch.rand(z0.size(0), device=self.device, dtype=torch.float32)
+                t_view = t.view(-1, 1, 1, 1)
+                x_t = (1 - t_view) * z0.float() + t_view * z1.float()
+
                 with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    t = torch.rand(z0.size(0), device=self.device)
-                    x_t = (1-t.view(-1,1,1,1)) * z0 + t.view(-1,1,1,1) * z1
                     v_pred = model(x_t, z0, t, t_id)
-                    loss = F.mse_loss(v_pred, z1 - z0)
+                v_pred = v_pred.float()
+
+                loss = F.mse_loss(v_pred, (z1 - z0).float())
+
+                # 🟢 保险：loss 为 NaN/Inf 时跳过该 batch
+                if not torch.isfinite(loss.detach()):
+                    self.logger.info(f"[S2] ⚠️  Non-finite loss (NaN/Inf). Skip batch. epoch={epoch}")
+                    pbar.set_postfix(loss="skip_nan")
+                    continue
                 
                 loss.backward()
                 opt.step()
+                scheduler.step()
                 
                 epoch_loss += loss.item()
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
@@ -700,10 +798,8 @@ class LSFMTrainer:
             if avg_loss < best_loss:
                 best_loss = avg_loss
             
-            current_lr = scheduler.get_last_lr()[0]
+            current_lr = opt.param_groups[0]['lr']
             self.logger.info(f"[S2] Epoch {epoch:03d} | Avg Loss: {avg_loss:.6f} | Best: {best_loss:.6f} | LR: {current_lr:.2e} | Time: {elapsed:.1f}s")
-            
-            scheduler.step()
             
             if epoch % EVAL_STEP == 0:
                 self.save_ckpt(model, opt, scheduler, epoch, avg_loss, best_loss, "stage2")

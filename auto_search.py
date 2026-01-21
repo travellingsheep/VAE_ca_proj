@@ -230,7 +230,11 @@ def run_evaluations(ckpt_path, exp_name, exp_ckpt_dir, config_path="config.json"
     with open(config_path, 'r', encoding='utf-8') as f:
         cfg = json.load(f)
     
-    ref_dir = cfg.get("data", {}).get("data_root", None)
+    # VGG 的 ref_root 需要“图片参考目录”（包含 trainA/trainB），而不是 latent 的 .pt 目录。
+    # 优先使用 evaluation.vgg_ref_root；否则回退到 data.raw_data_root。
+    ref_dir = cfg.get("evaluation", {}).get("vgg_ref_root", None)
+    if not ref_dir:
+        ref_dir = cfg.get("data", {}).get("raw_data_root", None)
     if ref_dir:
         ref_dir = ref_dir.strip('"').strip("'")
     
